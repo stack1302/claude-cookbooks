@@ -1,0 +1,216 @@
+name: "Docker Image CI + Run + Healthcheck + (Push on main)"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write     # GHCR 푸시에 필요
+  id-token: write     # OIDC 대비
+
+concurrency:
+  group: docker-image-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ARTIFACT_DIR: .github/echo_artifacts
+  DOCKER_BUILDKIT: "1"
+  # 실행 검사용 기본 포트/경로 (Dockerfile에서 8080으로 http.server 실행 예시)
+  HEALTH_PORT: "8080"
+  HEALTH_PATH: "/"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Echo helpers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ $(TS) $*"; }
+          WARN(){ echo "⚠️  $(TS) $*" >&2; }
+          FAIL(){ echo "❌ $(TS) $*" >&2; }
+          SAFE(){ if "$@"; then OK "OK: $*"; else FAIL "FAIL: $*"; return 1; fi; }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          source /tmp/echo_helpers.sh
+          OK "Helpers ready."
+
+      - name: Docker sanity
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          SAFE docker --version | tee "${LOG_DIR}/docker.version.txt"
+          SAFE docker info | tee "${LOG_DIR}/docker.info.txt"
+
+      - name: Setup Buildx (cache enabled)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: meta
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          ts="$(date +%Y%m%d%H%M%S)"
+          sha_short="${GITHUB_SHA::7}"
+          # 로컬 태그 (기존 코드 호환)
+          echo "local_tag=my-image-name:${ts}" | tee "${LOG_DIR}/image.local.txt"
+          # GHCR 태그 (OWNER/REPO 기준)
+          repo="ghcr.io/${GITHUB_REPOSITORY}"
+          echo "repo=${repo}" | tee -a "${LOG_DIR}/image.ghcr.txt"
+          echo "sha_tag=${repo}:${sha_short}" | tee -a "${LOG_DIR}/image.ghcr.txt"
+          echo "time_tag=${repo}:${ts}"       | tee -a "${LOG_DIR}/image.ghcr.txt"
+          echo "latest_tag=${repo}:latest"    | tee -a "${LOG_DIR}/image.ghcr.txt"
+          {
+            echo "local_tag=my-image-name:${ts}"
+            echo "repo=${repo}"
+            echo "sha_tag=${repo}:${sha_short}"
+            echo "time_tag=${repo}:${ts}"
+            echo "latest_tag=${repo}:latest"
+          } >> "$GITHUB_OUTPUT"
+
+      # 필요 시 Dockerfile 자동 생성(없을 때만)
+      - name: Generate minimal Dockerfile if missing
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          if [[ ! -f Dockerfile ]]; then
+            WARN "Dockerfile not found. Generating a minimal one."
+            cat > Dockerfile <<'DOCKERFILE'
+            FROM ubuntu:24.04
+            ENV DEBIAN_FRONTEND=noninteractive
+            RUN apt-get update -y && apt-get install -y --no-install-recommends \
+                  ca-certificates curl tini python3 && \
+                rm -rf /var/lib/apt/lists/*
+            WORKDIR /app
+            COPY . /app
+            EXPOSE 8080
+            ENTRYPOINT ["/usr/bin/tini","--"]
+            CMD ["bash","-lc","python3 -m http.server 8080"]
+            DOCKERFILE
+            OK "Generated minimal Dockerfile."
+          else
+            OK "Using existing Dockerfile."
+          fi
+
+      # PR에서는 push 안 하고 로컬 로드, push(main)에서는 push + (옵션)latest
+      - name: Build (PR:load only / Push:push to GHCR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ steps.meta.outputs.local_tag }}
+            ${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.time_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Login to GHCR (only on push)
+        if: ${{ github.event_name == 'push' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # main push에서만 latest로 추가 푸시(선택)
+      - name: Tag & push :latest (main push)
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          SAFE docker pull "${{ steps.meta.outputs.time_tag }}" || true
+          SAFE docker tag  "${{ steps.meta.outputs.time_tag }}" "${{ steps.meta.outputs.latest_tag }}"
+          SAFE docker push "${{ steps.meta.outputs.latest_tag }}" | tee "${LOG_DIR}/docker.push.latest.txt"
+
+      - name: Show images
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          SAFE docker images | tee "${LOG_DIR}/docker.images.txt"
+
+      # 컨테이너 실행(로컬 태그 사용) — PR에서도 테스트 가능
+      - name: Stop & remove previous container (if any)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          cname="ci-echo-app"
+          if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+            WARN "Container ${cname} exists; removing."
+            docker logs "${cname}" > "${LOG_DIR}/container.prev.log" 2>&1 || true
+            SAFE docker rm -f "${cname}"
+          else
+            OK "No existing container ${cname}"
+          fi
+
+      - name: Run container (detached)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          cname="ci-echo-app"
+          image="${{ steps.meta.outputs.local_tag }}"
+          SAFE docker run -d --name "${cname}" -p "${HEALTH_PORT}:${HEALTH_PORT}" "${image}" \
+            | tee "${LOG_DIR}/container.run.id.txt"
+          sleep 2
+          SAFE docker ps --filter "name=${cname}" --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" \
+            | tee "${LOG_DIR}/container.ps.txt"
+
+      - name: Healthcheck (curl inside or host)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          cname="ci-echo-app"
+          if docker exec "${cname}" sh -lc 'command -v curl' >/dev/null 2>&1; then
+            SAFE docker exec "${cname}" sh -lc "curl -fsS http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
+              | tee "${LOG_DIR}/health.container.curl.txt"
+          else
+            WARN "curl not in container; trying host mapped port"
+            SAFE bash -lc "curl -fsS http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
+              | tee "${LOG_DIR}/health.host.curl.txt"
+          fi
+          echo "OK" > "${ARTIFACT_DIR}/health.ok"
+
+      - name: Logs snapshot
+        if: always()
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          docker logs --since=0s ci-echo-app > "${LOG_DIR}/container.log" 2>&1 || true
+
+      # 필요 시 컨테이너 정리 (원하면 주석 해제)
+      # - name: Cleanup container
+      #   if: always()
+      #   shell: bash
+      #   run: |
+      #     source /tmp/echo_helpers.sh
+      #     SAFE docker rm -f ci-echo-app
+
+      - name: Upload artifacts (logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ci-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_artifacts/**
+          if-no-files-found: warn
