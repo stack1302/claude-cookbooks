@@ -1,4 +1,4 @@
-name: "Docker Image CI + Run + Healthcheck + (Push on main)"
+name: "Docker Image CI + Run + Healthcheck + (Push on main, Echo-Enhanced)"
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: read
-  packages: write     # GHCR 푸시에 필요
+  packages: write
   id-token: write
 
 concurrency:
@@ -26,40 +26,88 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Echo helpers
+      - name: Prepare echo helpers (global via BASH_ENV)
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
-          # 간단/안전 에코 유틸
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
-          OK(){ echo "✅ $(TS) $*"; }
-          WARN(){ echo "⚠️  $(TS) $*" >&2; }
-          FAIL(){ echo "❌ $(TS) $*" >&2; }
-          SAFE(){ if "$@"; then OK "OK: $*"; else FAIL "FAIL: $*"; return 1; fi; }
-          export -f TS OK WARN FAIL SAFE
-          OK "Helpers ready."
+
+          # ==== echo helpers (column-0; no heredoc pitfalls) ====
+          cat >/tmp/echo_helpers.sh <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# --- basic echo ---
+TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+OK(){ echo "✅ $(TS) $*"; }
+WARN(){ echo "⚠️  $(TS) $*" >&2; }
+FAIL(){ echo "❌ $(TS) $*" >&2; }
+
+# --- sections for nice logs ---
+SECTION(){ echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "🔷 $*"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
+
+# --- safe runner ---
+SAFE(){
+  if "$@"; then
+    OK "$*"
+  else
+    local rc=$?
+    FAIL "$* (exit $rc)"
+    return $rc
+  fi
+}
+
+# --- retry helper ---
+RETRY(){
+  local n="${1:-3}"; shift || true
+  local delay=2
+  local i
+  for ((i=1;i<=n;i++)); do
+    if "$@"; then
+      OK "Retry OK($i/$n): $*"
+      return 0
+    fi
+    WARN "Retry $i/$n failed: $*"
+    sleep "$delay"
+    delay=$((delay*2))
+  done
+  FAIL "All retries failed: $*"
+  return 1
+}
+SH
+          chmod +x /tmp/echo_helpers.sh
+
+          # 모든 bash 스텝에서 자동 로드
+          cat >/tmp/ci_bash_env <<'ENV'
+source /tmp/echo_helpers.sh
+set -Eeuo pipefail
+shopt -s expand_aliases
+ENV
+          echo "BASH_ENV=/tmp/ci_bash_env" >> "$GITHUB_ENV"
+
+          source /tmp/echo_helpers.sh
+          SECTION "Helpers"
+          OK "Echo helpers installed and auto-loaded."
 
       - name: Docker sanity
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Docker Sanity"
           SAFE docker --version | tee "${LOG_DIR}/docker.version.txt"
           SAFE docker info | tee "${LOG_DIR}/docker.info.txt"
 
-      - name: Setup Buildx (cache enabled)
+      - name: Setup Buildx (cache)
         uses: docker/setup-buildx-action@v3
 
       - name: Compute image tags
         id: meta
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Compute Image Tags"
           ts="$(date +%Y%m%d%H%M%S)"
           sha_short="${GITHUB_SHA::7}"
           echo "local_tag=my-image-name:${ts}" | tee "${LOG_DIR}/image.local.txt"
@@ -77,14 +125,14 @@ jobs:
             echo "time_tag=${repo}:${ts}"
             echo "latest_tag=${repo}:latest"
           } >> "$GITHUB_OUTPUT"
+          OK "Tags prepared."
 
-      - name: Generate minimal Dockerfile if missing (no heredoc)
+      - name: Generate minimal Dockerfile if missing (printf; no heredoc)
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Dockerfile Check/Generate"
           if [[ ! -f Dockerfile ]]; then
-            WARN(){ echo "⚠️  $(date "+%Y-%m-%d %H:%M:%S%z") $*" >&2; }; OK(){ echo "✅ $(date "+%Y-%m-%d %H:%M:%S%z") $*"; }
-            WARN "Dockerfile not found. Generating a minimal one via printf (heredoc-free)."
+            WARN "Dockerfile not found. Generating minimal via printf."
             : > Dockerfile
             printf '%s\n' "FROM ubuntu:24.04" >> Dockerfile
             printf '%s\n' "ENV DEBIAN_FRONTEND=noninteractive" >> Dockerfile
@@ -98,11 +146,10 @@ jobs:
             printf '%s\n' 'CMD ["bash","-lc","python3 -m http.server 8080"]' >> Dockerfile
             OK "Generated minimal Dockerfile."
           else
-            echo "✅ $(date "+%Y-%m-%d %H:%M:%S%z") Using existing Dockerfile."
+            OK "Using existing Dockerfile."
           fi
 
-      # PR에서는 load, main push에서는 push
-      - name: Build (PR:load / Push:push)
+      - name: Build (PR: load / Push: push)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -131,50 +178,53 @@ jobs:
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          docker pull "${{ steps.meta.outputs.time_tag }}" || true
-          docker tag  "${{ steps.meta.outputs.time_tag }}" "${{ steps.meta.outputs.latest_tag }}"
-          docker push "${{ steps.meta.outputs.latest_tag }}" | tee "${LOG_DIR}/docker.push.latest.txt"
+          SECTION "Push :latest"
+          RETRY 3 docker pull "${{ steps.meta.outputs.time_tag }}" || true
+          SAFE docker tag  "${{ steps.meta.outputs.time_tag }}" "${{ steps.meta.outputs.latest_tag }}"
+          SAFE docker push "${{ steps.meta.outputs.latest_tag }}" | tee "${LOG_DIR}/docker.push.latest.txt"
 
       - name: Show images
         shell: bash
         run: |
-          set -Eeuo pipefail
-          docker images | tee "${LOG_DIR}/docker.images.txt"
+          SECTION "Images"
+          SAFE docker images | tee "${LOG_DIR}/docker.images.txt"
 
       - name: Stop & remove previous container (if any)
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Cleanup Previous Container"
           cname="ci-echo-app"
           if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+            WARN "Container ${cname} exists; removing."
             docker logs "${cname}" > "${LOG_DIR}/container.prev.log" 2>&1 || true
-            docker rm -f "${cname}"
+            SAFE docker rm -f "${cname}"
+          else
+            OK "No existing container ${cname}"
           fi
 
       - name: Run container (detached)
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Run Container"
           cname="ci-echo-app"
           image="${{ steps.meta.outputs.local_tag }}"
-          docker run -d --name "${cname}" -p "${HEALTH_PORT}:${HEALTH_PORT}" "${image}" \
+          SAFE docker run -d --name "${cname}" -p "${HEALTH_PORT}:${HEALTH_PORT}" "${image}" \
             | tee "${LOG_DIR}/container.run.id.txt"
           sleep 2
-          docker ps --filter "name=${cname}" --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" \
+          SAFE docker ps --filter "name=${cname}" --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" \
             | tee "${LOG_DIR}/container.ps.txt"
 
-      - name: Healthcheck
+      - name: Healthcheck (inside curl → host fallback)
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Healthcheck"
           cname="ci-echo-app"
-          # 컨테이너 내부 curl → 없으면 호스트 포트로 시도
           if docker exec "${cname}" sh -lc 'command -v curl' >/dev/null 2>&1; then
-            docker exec "${cname}" sh -lc "curl -fsS http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
+            SAFE docker exec "${cname}" sh -lc "curl -fsS http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
               | tee "${LOG_DIR}/health.container.curl.txt"
           else
-            curl -fsS "http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
+            WARN "curl not in container; trying host mapped port"
+            SAFE bash -lc "curl -fsS http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}" \
               | tee "${LOG_DIR}/health.host.curl.txt"
           fi
           echo "OK" > "${ARTIFACT_DIR}/health.ok"
@@ -183,16 +233,34 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -Eeuo pipefail
+          SECTION "Log Snapshot"
           docker logs --since=0s ci-echo-app > "${LOG_DIR}/container.log" 2>&1 || true
 
-      # 필요시 정리 원하면 주석 해제
-      # - name: Cleanup container
+      # - name: Cleanup container (optional)
       #   if: always()
       #   shell: bash
       #   run: |
-      #     set -Eeuo pipefail
-      #     docker rm -f ci-echo-app || true
+      #     SECTION "Cleanup Container"
+      #     SAFE docker rm -f ci-echo-app || true
+
+      - name: CI Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Docker Image CI Summary"
+            echo ""
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Ref: \`${{ github.ref }}\`"
+            echo "- Repo: \`${{ github.repository }}\`"
+            echo "- Local Tag: \`${{ steps.meta.outputs.local_tag }}\`"
+            echo "- GHCR Tags: \`${{ steps.meta.outputs.sha_tag }}\`, \`${{ steps.meta.outputs.time_tag }}\`"
+            if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+              echo "- Pushed :latest: \`${{ steps.meta.outputs.latest_tag }}\`"
+            else
+              echo "- Pushed :latest: *(skipped)*"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts (logs)
         if: always()
